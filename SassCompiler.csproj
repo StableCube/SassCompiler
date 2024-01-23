@@ -9,6 +9,8 @@
     <GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>
     <RootNamespace>StableCube.SassCompiler</RootNamespace>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <ProjectUrl>https://github.com/StableCube/SassCompiler</ProjectUrl>
+    <RepositoryUrl>https://github.com/StableCube/SassCompiler</RepositoryUrl>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>true</IsPackable>
   </PropertyGroup>

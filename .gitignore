@@ -42,7 +42,7 @@ obj/
 *.launch
 .settings/
 *.sublime-workspace
-.sln
+*.sln
 ###################
 # IDE - VSCode
 ###################
