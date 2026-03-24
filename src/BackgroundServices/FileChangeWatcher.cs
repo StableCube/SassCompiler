@@ -17,7 +17,7 @@ public class FileChangeWatcher : BackgroundService
     private readonly Dictionary<string, string> _watchedFiles = [];
     private static bool _needsCompile = false;
     private readonly System.Timers.Timer _compileCheckTimer = new ();
-    private readonly TimeSpan _compileCheckInterval = TimeSpan.FromSeconds(1);
+    private readonly TimeSpan _compileCheckInterval = TimeSpan.FromMilliseconds(200);
     private static bool _isCompileRunning = false;
     private string _compileTargetCssPath;
 
@@ -34,15 +34,30 @@ public class FileChangeWatcher : BackgroundService
     {
         _cancellationToken = cancellationToken;
 
-        _logger.LogInformation("Sass compiler file change watcher starting");
+        _logger.LogDebug("Sass compiler file change watcher starting");
 
+        if(!File.Exists(_options.CompileTargetFile))
+        {
+            _logger.LogError("Compile target not found {CompileTargetFile}", _options.CompileTargetFile);
+            throw new FileNotFoundException("Compile target not found {CompileTargetFile}", _options.CompileTargetFile);
+        }
+
+        _options.FilesToWatch.Add(_options.CompileTargetFile);
+
+        var rootCompileTargetPath = Path.GetDirectoryName(_options.CompileTargetFile);
+        var compileTargetSassFilename = Path.GetFileNameWithoutExtension(_options.CompileTargetFile);
+        _compileTargetCssPath = Path.Combine(rootCompileTargetPath, $"{compileTargetSassFilename}.css");
+        if(!File.Exists(_compileTargetCssPath) || HasChanged(_options.CompileTargetFile, _compileTargetCssPath))
+        {
+            _needsCompile = true;
+        }
+        
         _changeCheckTimer.Elapsed += new ElapsedEventHandler(RunChangeCheck);
         _changeCheckTimer.Interval = _options.PollingInterval.TotalMilliseconds;
         _changeCheckTimer.Enabled = true;
 
         if (_cancellationToken.IsCancellationRequested == true)
             _changeCheckTimer.Enabled = false;
-
 
         _compileCheckTimer.Elapsed += new ElapsedEventHandler(RunCompileCheck);
         _compileCheckTimer.Interval = _compileCheckInterval.TotalMilliseconds;
@@ -56,7 +71,7 @@ public class FileChangeWatcher : BackgroundService
 
     private async void RunChangeCheck(object source, ElapsedEventArgs eventArgs)
     {
-        if(_isChangeCheckRunning)
+        if(_isCompileRunning || _needsCompile || _isChangeCheckRunning)
             return;
 
         _isChangeCheckRunning = true;
@@ -88,9 +103,6 @@ public class FileChangeWatcher : BackgroundService
 
     private async void RunCompileCheck(object source, ElapsedEventArgs eventArgs)
     {
-        if(string.IsNullOrEmpty(_compileTargetCssPath))
-            _needsCompile = true;
-        
         if(_isCompileRunning || !_needsCompile)
             return;
 
@@ -100,14 +112,9 @@ public class FileChangeWatcher : BackgroundService
         if(string.IsNullOrEmpty(_options.CompileTargetFile))
             _logger.LogError("No compile target defined in CompileTargetFile");
 
-        var rootPath = Path.GetDirectoryName(_options.CompileTargetFile);
-        var filenameWithoutExt = Path.GetFileNameWithoutExtension(_options.CompileTargetFile);
-        var sassFilename = Path.GetFileName(_options.CompileTargetFile);
-        var cssFilename = $"{filenameWithoutExt}.css";
-        var inputFilePath = Path.Combine(rootPath, sassFilename);
-        var outputFilePath = Path.Combine(rootPath, cssFilename);
+        await CompileSassAsync(_options.CompileTargetFile, _compileTargetCssPath, _cancellationToken);
 
-        await CompileSassAsync(inputFilePath, outputFilePath, _cancellationToken);
+        _logger.LogDebug("Recompiled {cssFilePath}", _compileTargetCssPath);
 
         _isCompileRunning = false;
     }
@@ -208,15 +215,20 @@ public class FileChangeWatcher : BackgroundService
         var rootPath = Path.GetDirectoryName(sourceSassPath);
         var sassFilename = Path.GetFileName(sourceSassPath);
         var inputFilePath = Path.Combine(rootPath, sassFilename);
-        var outputFilePath = Path.Combine(rootPath, _compileTargetCssPath);
 
-        var sourceLastChange = File.GetLastWriteTimeUtc(inputFilePath);
-        var destLastChange = File.GetLastWriteTimeUtc(outputFilePath);
-        if(sourceLastChange > destLastChange)
+        if(HasChanged(inputFilePath, _compileTargetCssPath))
         {
             _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
             _needsCompile = true;
         }
+    }
+
+    private static bool HasChanged(string pathA, string pathB)
+    {
+        var pathALastChange = File.GetLastWriteTimeUtc(pathA);
+        var pathBLastChange = File.GetLastWriteTimeUtc(pathB);
+
+        return pathALastChange > pathBLastChange;
     }
 
     private async Task CompileSassAsync(
