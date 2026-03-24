@@ -10,11 +10,16 @@ namespace StableCube.SassCompiler;
 public class FileChangeWatcher : BackgroundService
 {
     private static CancellationToken _cancellationToken;
-    private readonly System.Timers.Timer _timer = new ();
-    private static bool _isScanRunning = false;
+    private readonly System.Timers.Timer _changeCheckTimer = new ();
+    private static bool _isChangeCheckRunning = false;
     private readonly ILogger<FileChangeWatcher> _logger;
     private readonly SassCompilerOptions _options;
-    private Dictionary<string, string> _watchedFiles = [];
+    private readonly Dictionary<string, string> _watchedFiles = [];
+    private static bool _needsCompile = false;
+    private readonly System.Timers.Timer _compileCheckTimer = new ();
+    private readonly TimeSpan _compileCheckInterval = TimeSpan.FromSeconds(1);
+    private static bool _isCompileRunning = false;
+    private string _compileTargetCssPath;
 
     public FileChangeWatcher(
         ILogger<FileChangeWatcher> logger,
@@ -31,50 +36,83 @@ public class FileChangeWatcher : BackgroundService
 
         _logger.LogInformation("Sass compiler file change watcher starting");
 
-        _timer.Elapsed += new ElapsedEventHandler(RunChangeCheck);
-        _timer.Interval = _options.PollingInterval.TotalMilliseconds;
-        _timer.Enabled = true;
+        _changeCheckTimer.Elapsed += new ElapsedEventHandler(RunChangeCheck);
+        _changeCheckTimer.Interval = _options.PollingInterval.TotalMilliseconds;
+        _changeCheckTimer.Enabled = true;
 
         if (_cancellationToken.IsCancellationRequested == true)
-            _timer.Enabled = false;
+            _changeCheckTimer.Enabled = false;
+
+
+        _compileCheckTimer.Elapsed += new ElapsedEventHandler(RunCompileCheck);
+        _compileCheckTimer.Interval = _compileCheckInterval.TotalMilliseconds;
+        _compileCheckTimer.Enabled = true;
+
+        if (_cancellationToken.IsCancellationRequested == true)
+            _compileCheckTimer.Enabled = false;
 
         return Task.CompletedTask;
     }
 
     private async void RunChangeCheck(object source, ElapsedEventArgs eventArgs)
     {
-        if(_isScanRunning)
+        if(_isChangeCheckRunning)
             return;
 
-        _isScanRunning = true;
+        _isChangeCheckRunning = true;
 
         var filesToCheck = BuildFileCheckList();
         
         foreach (var filePath in filesToCheck)
         {
             var hash = await GetFileHashAsync(filePath, _cancellationToken);
-
             if(_watchedFiles.TryGetValue(filePath, out string existingHash))
             {
                 if(existingHash != hash)
                 {
-                    await OnChangedAsync(filePath, _cancellationToken);
+                    OnChanged(filePath);
 
                     _watchedFiles[filePath] = hash;
                 }
             }
             else
             {
-                await OnNewAsync(filePath, _cancellationToken);
+                OnNewFileDetected(filePath);
 
                 _watchedFiles.Add(filePath, hash);
             }
         }
 
-        _isScanRunning = false;
+        _isChangeCheckRunning = false;
     }
 
-    private async Task<string> GetFileHashAsync(string filePath, CancellationToken cancellationToken = default)
+    private async void RunCompileCheck(object source, ElapsedEventArgs eventArgs)
+    {
+        if(string.IsNullOrEmpty(_compileTargetCssPath))
+            _needsCompile = true;
+        
+        if(_isCompileRunning || !_needsCompile)
+            return;
+
+        _needsCompile = false;
+        _isCompileRunning = true;
+
+        if(string.IsNullOrEmpty(_options.CompileTargetFile))
+            _logger.LogError("No compile target defined in CompileTargetFile");
+
+        var rootPath = Path.GetDirectoryName(_options.CompileTargetFile);
+        var filenameWithoutExt = Path.GetFileNameWithoutExtension(_options.CompileTargetFile);
+        var sassFilename = Path.GetFileName(_options.CompileTargetFile);
+        var cssFilename = $"{filenameWithoutExt}.css";
+        var inputFilePath = Path.Combine(rootPath, sassFilename);
+        var outputFilePath = Path.Combine(rootPath, cssFilename);
+
+        await CompileSassAsync(inputFilePath, outputFilePath, _cancellationToken);
+
+        _isCompileRunning = false;
+    }
+
+    private static async Task<string> GetFileHashAsync(string filePath, CancellationToken cancellationToken = default)
     {
         var rawBytes = await File.ReadAllBytesAsync(filePath, cancellationToken);
         var hashValue = SHA256.HashData(rawBytes);
@@ -116,7 +154,7 @@ public class FileChangeWatcher : BackgroundService
 
     private IEnumerable<string> GetFiles(string path)
     {
-        Queue<string> queue = new Queue<string>();
+        Queue<string> queue = new();
         queue.Enqueue(path);
         while (queue.Count > 0)
         {
@@ -153,47 +191,32 @@ public class FileChangeWatcher : BackgroundService
         }
     }
 
-    private async Task OnChangedAsync(string sourceSassPath, CancellationToken cancellationToken = default)
+    private void OnChanged(string sourceSassPath)
     {
-        var rootPath = Path.GetDirectoryName(sourceSassPath);
-        var filenameWithoutExt = Path.GetFileNameWithoutExtension(sourceSassPath);
         var sassFilename = Path.GetFileName(sourceSassPath);
-        var cssFilename = $"{filenameWithoutExt}.css";
-        var inputFilePath = Path.Combine(rootPath, sassFilename);
-        var outputFilePath = Path.Combine(rootPath, cssFilename);
 
         _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
 
-        await CompileSassAsync(inputFilePath, outputFilePath, cancellationToken);
+        _needsCompile = true;
     }
 
-    private async Task OnNewAsync(string sourceSassPath, CancellationToken cancellationToken = default)
+    private void OnNewFileDetected(string sourceSassPath)
     {
+        if(string.IsNullOrEmpty(_compileTargetCssPath))
+            return;
+        
         var rootPath = Path.GetDirectoryName(sourceSassPath);
-        var filenameWithoutExt = Path.GetFileNameWithoutExtension(sourceSassPath);
         var sassFilename = Path.GetFileName(sourceSassPath);
-        var cssFilename = $"{filenameWithoutExt}.css";
         var inputFilePath = Path.Combine(rootPath, sassFilename);
-        var outputFilePath = Path.Combine(rootPath, cssFilename);
+        var outputFilePath = Path.Combine(rootPath, _compileTargetCssPath);
 
-        bool runCompile = false;
-        if(!File.Exists(outputFilePath))
+        var sourceLastChange = File.GetLastWriteTimeUtc(inputFilePath);
+        var destLastChange = File.GetLastWriteTimeUtc(outputFilePath);
+        if(sourceLastChange > destLastChange)
         {
-            runCompile = true;
+            _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
+            _needsCompile = true;
         }
-        else
-        {
-            var sourceLastChange = File.GetLastWriteTimeUtc(inputFilePath);
-            var destLastChange = File.GetLastWriteTimeUtc(outputFilePath);
-            if(sourceLastChange > destLastChange)
-            {
-                _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
-                runCompile = true;
-            }
-        }
-
-        if(runCompile)
-            await CompileSassAsync(inputFilePath, outputFilePath, cancellationToken);
     }
 
     private async Task CompileSassAsync(
