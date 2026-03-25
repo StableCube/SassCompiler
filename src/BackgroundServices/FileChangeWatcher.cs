@@ -10,16 +10,11 @@ namespace StableCube.SassCompiler;
 public class FileChangeWatcher : BackgroundService
 {
     private static CancellationToken _cancellationToken;
-    private readonly System.Timers.Timer _changeCheckTimer = new ();
-    private static bool _isChangeCheckRunning = false;
+    private readonly System.Timers.Timer _timer = new ();
+    private static bool _isScanRunning = false;
     private readonly ILogger<FileChangeWatcher> _logger;
     private readonly SassCompilerOptions _options;
     private readonly Dictionary<string, string> _watchedFiles = [];
-    private static bool _needsCompile = false;
-    private readonly System.Timers.Timer _compileCheckTimer = new ();
-    private readonly TimeSpan _compileCheckInterval = TimeSpan.FromMilliseconds(200);
-    private static bool _isCompileRunning = false;
-    private string _compileTargetCssPath;
 
     public FileChangeWatcher(
         ILogger<FileChangeWatcher> logger,
@@ -34,89 +29,49 @@ public class FileChangeWatcher : BackgroundService
     {
         _cancellationToken = cancellationToken;
 
-        _logger.LogDebug("Sass compiler file change watcher starting");
+        _logger.LogInformation("Sass compiler file change watcher starting");
 
-        if(!File.Exists(_options.CompileTargetFile))
-        {
-            _logger.LogError("Compile target not found {CompileTargetFile}", _options.CompileTargetFile);
-            throw new FileNotFoundException("Compile target not found {CompileTargetFile}", _options.CompileTargetFile);
-        }
-
-        _options.FilesToWatch.Add(_options.CompileTargetFile);
-
-        var rootCompileTargetPath = Path.GetDirectoryName(_options.CompileTargetFile);
-        var compileTargetSassFilename = Path.GetFileNameWithoutExtension(_options.CompileTargetFile);
-        _compileTargetCssPath = Path.Combine(rootCompileTargetPath, $"{compileTargetSassFilename}.css");
-        if(!File.Exists(_compileTargetCssPath) || HasChanged(_options.CompileTargetFile, _compileTargetCssPath))
-        {
-            _needsCompile = true;
-        }
-        
-        _changeCheckTimer.Elapsed += new ElapsedEventHandler(RunChangeCheck);
-        _changeCheckTimer.Interval = _options.PollingInterval.TotalMilliseconds;
-        _changeCheckTimer.Enabled = true;
+        _timer.Elapsed += new ElapsedEventHandler(RunChangeCheck);
+        _timer.Interval = _options.PollingInterval.TotalMilliseconds;
+        _timer.Enabled = true;
 
         if (_cancellationToken.IsCancellationRequested == true)
-            _changeCheckTimer.Enabled = false;
-
-        _compileCheckTimer.Elapsed += new ElapsedEventHandler(RunCompileCheck);
-        _compileCheckTimer.Interval = _compileCheckInterval.TotalMilliseconds;
-        _compileCheckTimer.Enabled = true;
-
-        if (_cancellationToken.IsCancellationRequested == true)
-            _compileCheckTimer.Enabled = false;
+            _timer.Enabled = false;
 
         return Task.CompletedTask;
     }
 
     private async void RunChangeCheck(object source, ElapsedEventArgs eventArgs)
     {
-        if(_isCompileRunning || _needsCompile || _isChangeCheckRunning)
+        if(_isScanRunning)
             return;
 
-        _isChangeCheckRunning = true;
+        _isScanRunning = true;
 
         var filesToCheck = BuildFileCheckList();
         
         foreach (var filePath in filesToCheck)
         {
             var hash = await GetFileHashAsync(filePath, _cancellationToken);
+
             if(_watchedFiles.TryGetValue(filePath, out string existingHash))
             {
                 if(existingHash != hash)
                 {
-                    OnChanged(filePath);
+                    await OnChangedAsync(filePath, _cancellationToken);
 
                     _watchedFiles[filePath] = hash;
                 }
             }
             else
             {
-                OnNewFileDetected(filePath);
+                await OnNewFileDetectedAsync(filePath, _cancellationToken);
 
                 _watchedFiles.Add(filePath, hash);
             }
         }
 
-        _isChangeCheckRunning = false;
-    }
-
-    private async void RunCompileCheck(object source, ElapsedEventArgs eventArgs)
-    {
-        if(_isCompileRunning || !_needsCompile)
-            return;
-
-        _needsCompile = false;
-        _isCompileRunning = true;
-
-        if(string.IsNullOrEmpty(_options.CompileTargetFile))
-            _logger.LogError("No compile target defined in CompileTargetFile");
-
-        await CompileSassAsync(_options.CompileTargetFile, _compileTargetCssPath, _cancellationToken);
-
-        _logger.LogDebug("Recompiled {cssFilePath}", _compileTargetCssPath);
-
-        _isCompileRunning = false;
+        _isScanRunning = false;
     }
 
     private static async Task<string> GetFileHashAsync(string filePath, CancellationToken cancellationToken = default)
@@ -161,7 +116,7 @@ public class FileChangeWatcher : BackgroundService
 
     private IEnumerable<string> GetFiles(string path)
     {
-        Queue<string> queue = new();
+        Queue<string> queue = new Queue<string>();
         queue.Enqueue(path);
         while (queue.Count > 0)
         {
@@ -198,37 +153,47 @@ public class FileChangeWatcher : BackgroundService
         }
     }
 
-    private void OnChanged(string sourceSassPath)
+    private async Task OnChangedAsync(string sourceSassPath, CancellationToken cancellationToken = default)
     {
+        var rootPath = Path.GetDirectoryName(sourceSassPath);
+        var filenameWithoutExt = Path.GetFileNameWithoutExtension(sourceSassPath);
         var sassFilename = Path.GetFileName(sourceSassPath);
+        var cssFilename = $"{filenameWithoutExt}.css";
+        var inputFilePath = Path.Combine(rootPath, sassFilename);
+        var outputFilePath = Path.Combine(rootPath, cssFilename);
 
         _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
 
-        _needsCompile = true;
+        await CompileSassAsync(inputFilePath, outputFilePath, cancellationToken);
     }
 
-    private void OnNewFileDetected(string sourceSassPath)
+    private async Task OnNewFileDetectedAsync(string sourceSassPath, CancellationToken cancellationToken = default)
     {
-        if(string.IsNullOrEmpty(_compileTargetCssPath))
-            return;
-        
         var rootPath = Path.GetDirectoryName(sourceSassPath);
+        var filenameWithoutExt = Path.GetFileNameWithoutExtension(sourceSassPath);
         var sassFilename = Path.GetFileName(sourceSassPath);
+        var cssFilename = $"{filenameWithoutExt}.css";
         var inputFilePath = Path.Combine(rootPath, sassFilename);
+        var outputFilePath = Path.Combine(rootPath, cssFilename);
 
-        if(HasChanged(inputFilePath, _compileTargetCssPath))
+        bool runCompile = false;
+        if(!File.Exists(outputFilePath))
         {
-            _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
-            _needsCompile = true;
+            runCompile = true;
         }
-    }
+        else
+        {
+            var sourceLastChange = File.GetLastWriteTimeUtc(inputFilePath);
+            var destLastChange = File.GetLastWriteTimeUtc(outputFilePath);
+            if(sourceLastChange > destLastChange)
+            {
+                _logger.LogDebug("Detected file change: {SassFilename}", sassFilename);
+                runCompile = true;
+            }
+        }
 
-    private static bool HasChanged(string pathA, string pathB)
-    {
-        var pathALastChange = File.GetLastWriteTimeUtc(pathA);
-        var pathBLastChange = File.GetLastWriteTimeUtc(pathB);
-
-        return pathALastChange > pathBLastChange;
+        if(runCompile)
+            await CompileSassAsync(inputFilePath, outputFilePath, cancellationToken);
     }
 
     private async Task CompileSassAsync(
